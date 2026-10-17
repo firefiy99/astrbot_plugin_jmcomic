@@ -30,6 +30,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star
+from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
@@ -416,7 +417,7 @@ class JMComicPlugin(Star):
         pass
 
     @jm.command("download", alias={"dl", "下载"})
-    async def download(self, event: AstrMessageEvent, content: str = ""):
+    async def download(self, event: AstrMessageEvent, content: GreedyStr = ""):
         """下载本子/章节（后台执行，完成后通知）。"""
         album_ids, photo_ids = _parse_ids(content)
         if not album_ids and not photo_ids:
@@ -473,7 +474,7 @@ class JMComicPlugin(Star):
         yield event.plain_result(self._format_album(album))
 
     @jm.command("search", alias={"搜索"})
-    async def search(self, event: AstrMessageEvent, content: str = ""):
+    async def search(self, event: AstrMessageEvent, content: GreedyStr = ""):
         """站内搜索本子。"""
         content = (content or "").strip()
         if not content:
@@ -608,7 +609,7 @@ class JMComicPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @jm.command("del", alias={"删除", "清理"})
-    async def jm_del(self, event: AstrMessageEvent, content: str = ""):
+    async def jm_del(self, event: AstrMessageEvent, content: GreedyStr = ""):
         """删除本地已下载内容：按车号删除，或清空全部（需二次确认）。"""
         content = (content or "").strip()
         if not content:

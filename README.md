@@ -103,6 +103,10 @@ pycryptodome / pyyaml）会一并安装。
 
 ## 更新日志
 
+### 2026-10-17 · v1.1.3
+
+- 修复：AstrBot 指令参数解析为「按空格切分、多余参数丢弃」，导致 `jm del all yes` 中的 `yes` 收不到、多车号批量下载（`jm download 123 456`）和搜索页码也失效；`download` / `search` / `del` 三个指令改用 `GreedyStr` 接收完整参数。
+
 ### 2026-10-17 · v1.1.2
 
 - 新增 `jm files`：查看本地已下载的本子目录与 zip/pdf 导出文件及占用空间；
