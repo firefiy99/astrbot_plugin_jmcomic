@@ -16,6 +16,7 @@
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -54,6 +55,8 @@ HELP_TEXT = (
     "jm rank [月|周|日]                   查看排行榜\n"
     "jm list                              查看进行中的下载任务\n"
     "jm cancel 车号                       取消下载任务\n"
+    "jm files                             查看本地已下载内容\n"
+    "jm del 车号 | jm del all             删除本地下载（all 需二次确认）\n"
     "jm help                              显示本帮助\n\n"
     "示例：\n"
     "  jm download 123\n"
@@ -212,6 +215,97 @@ class JMComicPlugin(Star):
 
         text = yaml.safe_dump(option_dict, allow_unicode=True, sort_keys=False)
         return jmcomic.create_option_by_str(text)
+
+    # ---------- 本地下载管理（jm files / jm del） ----------
+
+    def _download_root(self) -> str:
+        """返回下载根目录的绝对路径（不触发文件服务启动）。"""
+        cfg = self.config
+        base = str((cfg.get("download_dir") or "").strip() or DEFAULT_DOWNLOAD_DIR)
+        return os.path.abspath(base)
+
+    @staticmethod
+    def _dir_size(path: str) -> int:
+        total = 0
+        for dirpath, _, filenames in os.walk(path):
+            for name in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+        return total
+
+    @staticmethod
+    def _fmt_size(size: int) -> str:
+        size = int(size or 0)
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if size < 1024:
+                return f"{size}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.1f}TiB"
+
+    def _scan_local(self, root: str) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+        """扫描下载根目录，返回 (本子目录列表, zip/pdf 导出文件列表)，各为 (名称, 字节数)。"""
+        dirs: List[Tuple[str, int]] = []
+        files: List[Tuple[str, int]] = []
+        if not os.path.isdir(root):
+            return dirs, files
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name)
+            if os.path.isdir(p):
+                dirs.append((name, self._dir_size(p)))
+            elif os.path.isfile(p) and os.path.splitext(name)[1].lower() in (".zip", ".pdf"):
+                files.append((name, os.path.getsize(p)))
+        return dirs, files
+
+    @staticmethod
+    def _delete_local(root: str, aid: Optional[str] = None, delete_all: bool = False) -> Tuple[List[str], List[str]]:
+        """
+        删除下载根目录内的本地内容（只操作 root 内部，绝不动 root 本身与上层）。
+
+        :param aid: 本子车号；按 “<aid>_” 前缀匹配目录，并删除同名 zip/pdf 导出文件。
+        :param delete_all: 为 True 时清空 root 下所有子目录与 zip/pdf 文件。
+        :return: (删除的目录名列表, 删除的文件名列表)
+        """
+        removed_dirs: List[str] = []
+        removed_files: List[str] = []
+        if not os.path.isdir(root):
+            return removed_dirs, removed_files
+
+        if delete_all:
+            for name in os.listdir(root):
+                p = os.path.join(root, name)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed_dirs.append(name)
+                elif os.path.isfile(p) and os.path.splitext(name)[1].lower() in (".zip", ".pdf"):
+                    try:
+                        os.remove(p)
+                        removed_files.append(name)
+                    except OSError:
+                        pass
+            return removed_dirs, removed_files
+
+        prefix = f"{aid}_"
+        target_title: Optional[str] = None
+        for name in os.listdir(root):
+            p = os.path.join(root, name)
+            if os.path.isdir(p) and name.startswith(prefix):
+                shutil.rmtree(p, ignore_errors=True)
+                removed_dirs.append(name)
+                if target_title is None:
+                    target_title = name[len(prefix):]
+        # 删除该车号对应的导出文件（<title>.zip / <title>.pdf）
+        if target_title:
+            for ext in (".zip", ".pdf"):
+                fp = os.path.join(root, target_title + ext)
+                if os.path.isfile(fp):
+                    try:
+                        os.remove(fp)
+                        removed_files.append(target_title + ext)
+                    except OSError:
+                        pass
+        return removed_dirs, removed_files
 
     async def _get_album_detail(self, album_id: str):
         """用异步客户端查询本子详情。"""
@@ -484,6 +578,88 @@ class JMComicPlugin(Star):
                 yield event.plain_result(f"已请求取消任务 {info['desc']}，正在停止…")
                 return
         yield event.plain_result(f"没有找到包含车号 {target} 的进行中任务。")
+
+    @jm.command("files", alias={"本地", "已下载"})
+    async def jm_files(self, event: AstrMessageEvent):
+        """查看本地已下载的本子与导出文件。"""
+        root = self._download_root()
+        if not os.path.isdir(root):
+            yield event.plain_result("还没有下载过本子（下载目录不存在）。")
+            return
+        dirs, files = self._scan_local(root)
+        if not dirs and not files:
+            yield event.plain_result("下载目录为空，暂无本地内容。")
+            return
+        total = sum(s for _, s in dirs) + sum(s for _, s in files)
+        lines = [
+            f"📁 本地已下载：{len(dirs)} 个本子 / {len(files)} 个导出文件"
+            f"（共 {self._fmt_size(total)}）"
+        ]
+        for name, size in dirs:
+            aid, _, title = name.partition("_")
+            title = title or "-"
+            lines.append(f"  · [{aid}] {_truncate(title, 40)}（{self._fmt_size(size)}）")
+        if files:
+            shown = "、".join(f"{n}（{self._fmt_size(s)}）" for n, s in files[:8])
+            lines.append(f"  📦 导出文件：{shown}")
+            if len(files) > 8:
+                lines.append(f"  … 共 {len(files)} 个导出文件")
+        lines.append("清理：jm del 车号 / jm del all")
+        yield event.plain_result("\n".join(lines))
+
+    @jm.command("del", alias={"删除", "清理"})
+    async def jm_del(self, event: AstrMessageEvent, content: str = ""):
+        """删除本地已下载内容：按车号删除，或清空全部（需二次确认）。"""
+        content = (content or "").strip()
+        if not content:
+            yield event.plain_result("用法：jm del 车号（删除指定本子）/ jm del all（清空全部，需二次确认）")
+            return
+        root = self._download_root()
+        if not os.path.isdir(root):
+            yield event.plain_result("下载目录不存在，无需清理。")
+            return
+
+        low = content.lower().split()
+        if low[0] == "all":
+            if self._tasks:
+                yield event.plain_result("有进行中的下载任务，请先等待完成或 /jm cancel 后再清空，避免误删正在写入的文件。")
+                return
+            dirs, files = self._scan_local(root)
+            if not dirs and not files:
+                yield event.plain_result("下载目录为空，无需清理。")
+                return
+            total = sum(s for _, s in dirs) + sum(s for _, s in files)
+            if len(low) == 1 or low[1] not in ("yes", "y", "确认", "是"):
+                yield event.plain_result(
+                    f"⚠️ 即将删除全部本地下载（{len(dirs)} 个本子 / {len(files)} 个导出文件，"
+                    f"共 {self._fmt_size(total)}）。此操作不可恢复，"
+                    "再次发送 jm del all yes 确认执行。"
+                )
+                return
+            removed_dirs, removed_files = self._delete_local(root, delete_all=True)
+            yield event.plain_result(
+                f"🗑️ 已清空：删除 {len(removed_dirs)} 个本子目录、{len(removed_files)} 个导出文件。"
+            )
+            return
+
+        aid = _first_id(content)
+        if not aid:
+            yield event.plain_result("未识别到车号。用法：jm del 车号 / jm del all")
+            return
+        for info in self._tasks.values():
+            if aid in info["ids"]:
+                yield event.plain_result("该车号有任务正在下载中，请先 /jm cancel 再删除。")
+                return
+        removed_dirs, removed_files = self._delete_local(root, aid=aid)
+        if not removed_dirs and not removed_files:
+            yield event.plain_result(f"没有找到本地已下载的车号 {aid}。可用 jm files 查看已下载内容。")
+            return
+        parts = []
+        if removed_dirs:
+            parts.append("目录：" + "、".join(_truncate(d, 40) for d in removed_dirs[:10]))
+        if removed_files:
+            parts.append("导出文件：" + "、".join(removed_files[:10]))
+        yield event.plain_result(f"🗑️ 已删除车号 {aid} 的本地下载。" + ("（" + "；".join(parts) + "）" if parts else ""))
 
     @jm.command("help", alias={"帮助", "?"})
     async def help_cmd(self, event: AstrMessageEvent):
