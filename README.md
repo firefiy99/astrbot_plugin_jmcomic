@@ -17,6 +17,7 @@
 - 🎯 **站内搜索**：关键词搜索（支持页码），结果含车号可直接下载
 - 🏆 **排行榜**：本月 / 本周 / 今日排行
 - ⏳ **任务管理**：`jm list` 查看进行中任务，`jm cancel` 取消任务
+- 📤 **下载后发送到 QQ**：支持 zip 压缩包、合并 PDF、逐张图片直发三种方式（默认 zip），无需登录服务器即可收到内容
 - ⚙️ **配置化**：客户端实现（移动端/网页端）、下载目录、图片格式转换、并发数、代理、
   自定义域名、繁简归一化均可通过插件 WebUI 配置页调整，无需手写 option 文件
 - 🔄 请求自动重试、域名自动切换（jmcomic 自带机制）
@@ -70,6 +71,10 @@ pycryptodome / pyyaml）会一并安装。
 | domain | 自定义禁漫域名列表（逗号/换行分隔）；留空自动获取可用域名 | 空 |
 | normalize_zh | 繁简归一化：`zh-cn` 转简体、`zh-tw` 转繁体、留空不转换 | 空 |
 | jm_log | 是否输出 jmcomic 详细请求日志（排查问题用） | false |
+| send_mode | 下载完成后如何发送到聊天：`zip`=打包压缩包发送文件；`pdf`=合并整本为 PDF 发送；`images`=逐张发送图片（慎用）；`none`=仅保存服务器并发送文本通知 | zip |
+| keep_files | 发送后是否保留服务器本地文件；关闭后 zip/pdf 模式会在打包完成后删除原图文件夹 | true |
+| file_server_port | 内置 HTTP 文件服务端口（供 NapCat 从 astrbot 容器拉取 zip/pdf） | 18766 |
+| file_server_host | NapCat 访问 astrbot 容器使用的地址：同 docker 网络填容器名 `astrbot`；跨宿主机填服务器公网 IP | astrbot |
 
 下载目录结构：`<download_dir>/<album_id>_<album_title>/`（规则 `Bd_Aid_Atitle`）。
 
@@ -84,6 +89,8 @@ pycryptodome / pyyaml）会一并安装。
 2. **下载失败/IP 地区受限**：改用 `api`（移动端）客户端，或配置代理（如服务器所在地可访问的 HTTP 代理）。
 3. **下载很慢**：适当调大 thread_photo / thread_image，注意不要过度并发给站点服务器造成压力。
 4. **提示域名不可用**：留空 domain 配置让其自动获取，或手动填入当前可用域名。
+5. **zip/pdf 发不到 QQ**：确认 astrbot 与 napcat 容器在同一 docker 网络（如 appnet），且 `file_server_host` 填容器名 `astrbot`（或服务器公网 IP）；插件会在下载时自动拉起内置文件服务。images 模式走 base64 直发，不受此限制。
+6. **images 直发刷屏**：images 模式单任务最多发送 50 张，超出部分保留在服务器；建议改用 zip/pdf。
 
 ## 免责声明
 
@@ -93,6 +100,13 @@ pycryptodome / pyyaml）会一并安装。
 - 友情提示：珍爱 JM，请勿一次性批量下载大量本子，避免给站点服务器增加压力。
 
 ## 更新日志
+
+### 2026-10-17 · v1.1.0
+
+- 新增下载完成后的发送模式 `send_mode`：zip（默认，打包压缩包发送文件）/ pdf（合并整本为 PDF）/ images（逐张图片直发，最多 50 张）/ none（仅保存本地）；
+- zip/pdf 通过 astrbot 容器内置 HTTP 文件服务（默认端口 18766）让 NapCat 拉取后发送到 QQ，无需共享目录；
+- 新增配置：`keep_files`（打包后是否删除原图）、`file_server_port`、`file_server_host`；
+- 依赖新增 `img2pdf`（pdf 模式所需）。
 
 ### 2026-10-17 · v1.0.0
 

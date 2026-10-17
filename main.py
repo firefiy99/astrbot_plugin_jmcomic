@@ -14,15 +14,20 @@
 """
 
 import asyncio
+import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import yaml
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -38,6 +43,9 @@ PLUGIN_NAME = "astrbot_plugin_jmcomic"
 DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
 DEFAULT_DOWNLOAD_DIR = DATA_DIR / "downloads"
 
+# images 模式单次最多直发的图片数，防止大本子刷屏被风控
+MAX_IMAGES_SEND = 50
+
 HELP_TEXT = (
     "📥 禁漫下载助手使用说明\n\n"
     "jm download 车号 [p章节] [车号...]    下载本子/章节（后台执行，完成后通知）\n"
@@ -51,7 +59,7 @@ HELP_TEXT = (
     "  jm download 123\n"
     "  jm download 123 456 p789\n"
     "  jm info 350234\n\n"
-    "配置：插件设置页可调整客户端实现（移动端/网页端）、下载目录、并发数、代理等。\n"
+    "配置：插件设置页可调整客户端实现（移动端/网页端）、下载目录、发送模式（zip/pdf/images/none）、并发数、代理等。\n"
     "温馨提示：珍爱 JM，请勿一次性批量下载大量本子，避免给服务器增加压力。\n\n"
     "⚠️ 免责声明：本插件仅供个人学习交流使用，请遵守所在地区法律法规，"
     "请勿将下载内容用于传播或商业用途。"
@@ -104,6 +112,10 @@ class JMComicPlugin(Star):
         self.config = config
         # key -> {task, control, started, desc, ids}
         self._tasks: Dict[str, Dict[str, Any]] = {}
+        # 内置 HTTP 文件服务（供 NapCat 从 astrbot 容器拉取文件发送到 QQ）
+        self._file_server_proc: Optional[subprocess.Popen] = None
+        self._file_server_dir: Optional[str] = None
+        self._file_server_port: int = 0
 
     # ---------- 配置 ----------
 
@@ -162,6 +174,32 @@ class JMComicPlugin(Star):
             },
             "plugins": {"dependencies_strategy": "failed-fast", "valid": "log"},
         }
+        send_mode = str(cfg.get("send_mode") or "zip").strip()
+        if send_mode not in ("zip", "pdf", "images", "none"):
+            send_mode = "zip"
+        keep_files = bool(cfg.get("keep_files", True))
+        if send_mode == "zip":
+            option_dict["plugins"]["after_album"] = [{
+                "plugin": "zip",
+                "kwargs": {
+                    "suffix": "zip",
+                    "zip_dir": base_dir,
+                    "filename_rule": "Atitle",
+                    "level": "album",
+                    "delete_original_file": not keep_files,
+                },
+            }]
+        elif send_mode == "pdf":
+            option_dict["plugins"]["after_album"] = [{
+                "plugin": "img2pdf",
+                "kwargs": {
+                    "pdf_dir": base_dir,
+                    "filename_rule": "Atitle",
+                    "delete_original_file": not keep_files,
+                },
+            }]
+        if send_mode in ("zip", "pdf"):
+            self._ensure_file_server(base_dir)
         if domain:
             option_dict["client"]["domain"] = [
                 d.strip() for d in re.split(r"[,，\n]+", domain) if d.strip()
@@ -186,6 +224,95 @@ class JMComicPlugin(Star):
                 await client.close()
             except Exception:
                 pass
+
+    # ---------- 内置文件服务（zip/pdf 发送模式） ----------
+
+    def _ensure_file_server(self, base_dir: str) -> None:
+        """
+        在 astrbot 容器内启动 python http.server 托管下载目录，
+        供 NapCat 通过 http://<file_server_host>:<port>/... 拉取文件后发送到 QQ。
+        """
+        try:
+            port = int(self.config.get("file_server_port") or 18766)
+        except (TypeError, ValueError):
+            port = 18766
+        if port < 1 or port > 65535:
+            port = 18766
+        if (self._file_server_proc is not None
+                and self._file_server_dir == base_dir
+                and self._file_server_port == port):
+            if self._file_server_proc.poll() is None:
+                return
+        self._stop_file_server()
+        self._file_server_dir = base_dir
+        self._file_server_port = port
+        try:
+            self._file_server_proc = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port),
+                 "--bind", "0.0.0.0", "--directory", str(base_dir)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(f"[jmcomic] 文件服务已启动 http://0.0.0.0:{port} → {base_dir}")
+        except Exception as e:
+            logger.error(f"[jmcomic] 文件服务启动失败: {e}")
+            self._file_server_proc = None
+
+    def _stop_file_server(self) -> None:
+        if self._file_server_proc is not None:
+            try:
+                self._file_server_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._file_server_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._file_server_proc.kill()
+                except Exception:
+                    pass
+            self._file_server_proc = None
+        self._file_server_dir = None
+
+    async def _send_file(self, umo: str, file_path: str) -> bool:
+        """通过内置文件服务把本地文件以 URL 形式交给 NapCat 发送。"""
+        try:
+            base_dir = self._file_server_dir
+            if not base_dir:
+                return False
+            rel = os.path.relpath(file_path, base_dir)
+            url_path = quote(rel.replace(os.sep, "/"))
+            host = str(self.config.get("file_server_host") or "astrbot").strip() or "astrbot"
+            port = self._file_server_port
+            url = f"http://{host}:{port}/{url_path}"
+            mc = MessageChain(chain=[File(name=os.path.basename(file_path), url=url)])
+            await self.context.send_message(umo, mc)
+            return True
+        except Exception as e:
+            logger.error(f"[jmcomic] 发送文件失败: {e}")
+            return False
+
+    async def _send_images(self, umo: str, image_files: List[str]) -> None:
+        """逐张发送本地图片（Image 组件会转 base64，跨容器可用）。"""
+        files = image_files[:MAX_IMAGES_SEND]
+        for path in files:
+            try:
+                await self.context.send_message(
+                    umo, MessageChain(chain=[Image.fromFileSystem(path)])
+                )
+            except Exception as e:
+                logger.error(f"[jmcomic] 发送图片失败: {e}")
+            await asyncio.sleep(0.4)
+        extra = len(image_files) - len(files)
+        if extra > 0:
+            try:
+                await self.context.send_message(
+                    umo, MessageChain().message(
+                        f"图片较多，已发送前 {len(files)} 张，其余 {extra} 张保存在服务器。"
+                    )
+                )
+            except Exception as e:
+                logger.error(f"[jmcomic] 发送提示失败: {e}")
 
     # ---------- 指令组 ----------
 
@@ -374,19 +501,21 @@ class JMComicPlugin(Star):
         option,
         control,
     ):
-        """后台执行下载并在完成后把结果发回原会话。"""
+        """后台执行下载，完成后按发送模式把内容发回原会话。"""
+        export_files: List[str] = []
+        image_files: List[str] = []
         try:
             lines: List[str] = []
             if album_ids:
                 res = await jmcomic.download_album_async(
                     album_ids, option=option, control=control, check_exception=False
                 )
-                self._collect_result(lines, res)
+                self._collect_result(lines, res, export_files, image_files)
             if photo_ids:
                 res = await jmcomic.download_photo_async(
                     photo_ids, option=option, control=control, check_exception=False
                 )
-                self._collect_result(lines, res)
+                self._collect_result(lines, res, export_files, image_files)
             msg = "\n".join(lines) if lines else "下载任务已完成，但没有返回结果。"
         except asyncio.CancelledError:
             msg = "下载任务已被取消。"
@@ -395,22 +524,46 @@ class JMComicPlugin(Star):
             msg = f"下载失败：{_truncate(e, 200)}"
         finally:
             self._tasks.pop(key, None)
+
+        send_mode = str(self.config.get("send_mode") or "zip").strip()
+        if send_mode not in ("zip", "pdf", "images", "none"):
+            send_mode = "zip"
         try:
+            if send_mode == "images" and image_files:
+                await self._send_images(umo, image_files)
+            elif send_mode in ("zip", "pdf") and export_files:
+                sent = 0
+                for path in export_files:
+                    if await self._send_file(umo, path):
+                        sent += 1
+                    else:
+                        msg += f"\n⚠️ 文件 {os.path.basename(path)} 发送失败，已保存在服务器。"
+                if sent:
+                    msg += f"\n已发送 {sent} 个文件到当前会话。"
             await self.context.send_message(umo, MessageChain().message(msg))
         except Exception as e:
             logger.error(f"[jmcomic] 发送下载结果失败: {e}")
 
-    def _collect_result(self, lines: List[str], res: Any) -> None:
-        """把下载结果（单个或批量）整理成文本行。"""
+    def _collect_result(self, lines: List[str], res: Any,
+                        export_files: List[str], image_files: List[str]) -> None:
+        """把下载结果（单个或批量）整理成文本行，并收集可发送的文件。"""
+
+        def _process(item: Any) -> None:
+            detail = getattr(item, "detail", item)
+            lines.append(self._format_downloaded(detail))
+            manifest = getattr(item, "manifest", None)
+            if manifest is not None:
+                export_files.extend(manifest.get_export_filepath_list("zip"))
+                export_files.extend(manifest.get_export_filepath_list("pdf"))
+                image_files.extend(manifest.image_filepath_list)
+
         if isinstance(res, jmcomic.BatchResult):
             for item in res.succeeded:
-                detail = getattr(item, "detail", item)
-                lines.append(self._format_downloaded(detail))
+                _process(item)
             for aid, err in res.failed.items():
                 lines.append(f"❌ [{aid}] {_truncate(err, 150)}")
             return
-        detail = getattr(res, "detail", res)
-        lines.append(self._format_downloaded(detail))
+        _process(res)
 
     @staticmethod
     def _format_downloaded(detail) -> str:
@@ -453,10 +606,11 @@ class JMComicPlugin(Star):
         return "\n".join(lines)
 
     async def terminate(self):
-        """插件卸载/停用时取消所有进行中的下载任务。"""
+        """插件卸载/停用时取消所有进行中的下载任务并停止文件服务。"""
         for info in self._tasks.values():
             try:
                 info["control"].cancel("插件卸载")
                 info["task"].cancel()
             except Exception:
                 pass
+        self._stop_file_server()

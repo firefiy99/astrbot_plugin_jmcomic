@@ -1,2 +1,4 @@
 # jmcomic（含其依赖 commonx / curl-cffi / pillow / pycryptodome / pyyaml）
+# img2pdf：send_mode=pdf 时合并整本为 PDF 所需
 jmcomic>=2.7.9
+img2pdf>=1.0.5

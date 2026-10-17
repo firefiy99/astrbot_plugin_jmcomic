@@ -46,6 +46,28 @@
     "hint": "例如：zh-cn",
     "default": ""
   },
+  "send_mode": {
+    "description": "下载完成后如何发送到聊天：zip=打包压缩包发送文件；pdf=合并整本为 PDF 发送；images=逐张发送图片（大本子会刷屏，慎用）；none=仅保存服务器并发送文本通知",
+    "type": "string",
+    "options": ["zip", "pdf", "images", "none"],
+    "default": "zip"
+  },
+  "keep_files": {
+    "description": "发送后是否保留服务器本地文件；关闭后 zip/pdf 模式会在打包完成后删除原图文件夹",
+    "type": "bool",
+    "default": true
+  },
+  "file_server_port": {
+    "description": "内置 HTTP 文件服务端口（供 NapCat 从 astrbot 容器拉取 zip/pdf 后发送到 QQ）",
+    "type": "int",
+    "default": 18766
+  },
+  "file_server_host": {
+    "description": "NapCat 访问 astrbot 容器时使用的地址：同 docker 网络填容器名 astrbot；非同网络填服务器公网 IP",
+    "type": "string",
+    "hint": "默认 astrbot（两容器需在同一 docker 网络，如 appnet）",
+    "default": "astrbot"
+  },
   "jm_log": {
     "description": "是否输出 jmcomic 的详细请求日志（排查问题时开启）",
     "type": "bool",
