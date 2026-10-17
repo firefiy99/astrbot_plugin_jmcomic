@@ -103,6 +103,10 @@ pycryptodome / pyyaml）会一并安装。
 
 ## 更新日志
 
+### 2026-10-17 · v1.1.4
+
+- 修复 v1.1.3 未真正生效：AstrBot 仅在参数**没有默认值**时才把注解类型（`GreedyStr`）用于贪婪合并判定；v1.1.3 写成 `content: GreedyStr = ""` 带默认值，仍按普通字符串处理导致 `jm del all yes` 的 `yes` 收不到。本版将 `download` / `search` / `del` 的参数改为无默认值 `content: GreedyStr`（空参数时得到空字符串，不报错）。
+
 ### 2026-10-17 · v1.1.3
 
 - 修复：AstrBot 指令参数解析为「按空格切分、多余参数丢弃」，导致 `jm del all yes` 中的 `yes` 收不到、多车号批量下载（`jm download 123 456`）和搜索页码也失效；`download` / `search` / `del` 三个指令改用 `GreedyStr` 接收完整参数。
