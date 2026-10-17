@@ -1,0 +1,2 @@
+# jmcomic（含其依赖 commonx / curl-cffi / pillow / pycryptodome / pyyaml）
+jmcomic>=2.7.9
