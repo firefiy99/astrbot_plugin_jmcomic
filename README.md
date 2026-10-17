@@ -101,6 +101,10 @@ pycryptodome / pyyaml）会一并安装。
 
 ## 更新日志
 
+### 2026-10-17 · v1.1.1
+
+- 修复：requirements.txt 中 img2pdf 版本号写错（不存在 1.x，实际最新为 0.6.x），导致 AstrBot 安装依赖失败，改为 `img2pdf>=0.5.0`。
+
 ### 2026-10-17 · v1.1.0
 
 - 新增下载完成后的发送模式 `send_mode`：zip（默认，打包压缩包发送文件）/ pdf（合并整本为 PDF）/ images（逐张图片直发，最多 50 张）/ none（仅保存本地）；
