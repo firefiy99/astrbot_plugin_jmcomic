@@ -48,9 +48,15 @@ DEFAULT_DOWNLOAD_DIR = DATA_DIR / "downloads"
 # images 模式单次最多直发的图片数，防止大本子刷屏被风控
 MAX_IMAGES_SEND = 50
 
+# jm stop 后等待任务在 jmcomic 检查点优雅退出的秒数，超时再强制中断
+FORCE_CANCEL_GRACE = 5.0
+
 HELP_TEXT = (
     "📥 禁漫下载助手使用说明\n\n"
-    "jm download 车号 [p章节] [车号...]    下载本子/章节（后台执行，完成后通知）\n"
+    "jm download 车号 [p章节] [车号...]    下载本子/章节（后台执行）\n"
+    "jm send [车号]                       确认发送已下载好的内容\n"
+    "jm resend [车号]                     重新发送（发送失败时重试）\n"
+    "jm stop [车号]                       停止下载（进行中的任务）\n"
     "jm info 车号                         查看本子详情\n"
     "jm search 关键词 [页码]              站内搜索\n"
     "jm rank [月|周|日]                   查看排行榜\n"
@@ -61,9 +67,11 @@ HELP_TEXT = (
     "jm help                              显示本帮助\n\n"
     "示例：\n"
     "  jm download 123\n"
-    "  jm download 123 456 p789\n"
-    "  jm info 350234\n\n"
-    "配置：插件设置页可调整客户端实现（移动端/网页端）、下载目录、发送模式（zip/pdf/images/none）、并发数、代理等。\n"
+    "  jm send 123\n"
+    "  jm resend 123\n"
+    "  jm stop 123\n\n"
+    "配置：插件设置页可调整客户端实现（移动端/网页端）、下载目录、发送模式（zip/pdf/images/none）、"
+    "下载后是否需确认发送、并发数、代理等。\n"
     "温馨提示：珍爱 JM，请勿一次性批量下载大量本子，避免给服务器增加压力。\n\n"
     "⚠️ 免责声明：本插件仅供个人学习交流使用，请遵守所在地区法律法规，"
     "请勿将下载内容用于传播或商业用途。"
@@ -120,6 +128,9 @@ class JMComicPlugin(Star):
         self._file_server_proc: Optional[subprocess.Popen] = None
         self._file_server_dir: Optional[str] = None
         self._file_server_port: int = 0
+        # 已下载完成、等待用户确认发送的任务：pending_id -> {umo, desc, ids, export_files, image_files, send_mode, created}
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self._pending_seq: int = 0
 
     # ---------- 配置 ----------
 
@@ -422,7 +433,7 @@ class JMComicPlugin(Star):
         album_ids, photo_ids = _parse_ids(content)
         if not album_ids and not photo_ids:
             yield event.plain_result(
-                "未识别到车号。用法：jm download 车号 [p章节] [车号...]，",
+                "未识别到车号。用法：jm download 车号 [p章节] [车号...]，"
                 "例如：jm download 123 或 jm download 123 p456"
             )
             return
@@ -456,7 +467,10 @@ class JMComicPlugin(Star):
             "desc": desc,
             "ids": all_ids,
         }
-        yield event.plain_result(f"⏬ 已开始下载 {desc}，完成后会通知你。")
+        tip = f"⏬ 已开始下载 {desc}，完成后会通知你。"
+        if bool(self.config.get("confirm_before_send", True)):
+            tip += "\n（下载完成后需发送 jm send 确认才会发送文件）"
+        yield event.plain_result(tip)
 
     @jm.command("info", alias={"信息", "详情", "mv"})
     async def info(self, event: AstrMessageEvent, jmid: str):
@@ -555,15 +569,32 @@ class JMComicPlugin(Star):
 
     @jm.command("list", alias={"列表", "状态"})
     async def jm_list(self, event: AstrMessageEvent):
-        """查看进行中的下载任务。"""
-        if not self._tasks:
-            yield event.plain_result("当前没有进行中的下载任务。")
+        """查看进行中的下载任务与待发送内容。"""
+        if not self._tasks and not self._pending:
+            yield event.plain_result("当前没有进行中的下载任务，也没有待发送内容。")
             return
         now = time.time()
-        lines = ["⏳ 进行中的下载任务："]
-        for info in self._tasks.values():
-            elapsed = int(now - info["started"])
-            lines.append(f"· {info['desc']}（已进行 {elapsed}s）")
+        lines: List[str] = []
+        if self._tasks:
+            lines.append("⏳ 进行中的下载任务：")
+            for info in self._tasks.values():
+                elapsed = int(now - info["started"])
+                lines.append(f"· {info['desc']}（已进行 {elapsed}s，jm stop 可停止）")
+        if self._pending:
+            if lines:
+                lines.append("")
+            lines.append("📦 待确认发送：")
+            for info in self._pending.values():
+                desc = info.get("desc") or "内容"
+                files = len(info.get("export_files") or [])
+                images = len(info.get("image_files") or [])
+                parts = []
+                if files:
+                    parts.append(f"文件 {files}")
+                if images:
+                    parts.append(f"图片 {images}")
+                detail = "、".join(parts) if parts else "无文件"
+                lines.append(f"· {desc}（{detail}）→ jm send {info['ids'][0] if info.get('ids') else ''}")
         yield event.plain_result("\n".join(lines))
 
     @jm.command("cancel", alias={"取消"})
@@ -662,6 +693,191 @@ class JMComicPlugin(Star):
             parts.append("导出文件：" + "、".join(removed_files[:10]))
         yield event.plain_result(f"🗑️ 已删除车号 {aid} 的本地下载。" + ("（" + "；".join(parts) + "）" if parts else ""))
 
+    @jm.command("send", alias={"确认发送", "发送"})
+    async def jm_send(self, event: AstrMessageEvent, content: GreedyStr):
+        """确认发送：把已下载完成、等待确认的内容发送到当前会话。"""
+        async for line in self._do_send(event, content, resend=False):
+            yield line
+
+    @jm.command("resend", alias={"重发", "重新发送"})
+    async def jm_resend(self, event: AstrMessageEvent, content: GreedyStr):
+        """重新发送：对已下载完成的内容再次发送（发送失败时重试）。"""
+        async for line in self._do_send(event, content, resend=True):
+            yield line
+
+    async def _do_send(self, event: AstrMessageEvent, content: str, resend: bool):
+        """send / resend 的共同实现（异步生成器，调用方必须用 async for 迭代）。"""
+        target = _first_id(content)
+        pactions = list(self._pending.items())
+        if target:
+            matched = [(pid, info) for pid, info in pactions if target in info["ids"]]
+            if not matched:
+                if not self._local_exists(target):
+                    yield event.plain_result(
+                        f"没有找到车号 {target} 的待发送内容（本地也没有下载记录）。"
+                    )
+                    return
+                # 待发送记录已丢失（插件重启等），从本地下载目录重建
+                matched = [("local", {"ids": [target], "desc": f"album:{target}"})]
+            pactions = matched
+        if not pactions:
+            yield event.plain_result(
+                "当前没有待发送的内容。下载完成后会提示你确认发送（jm send 车号）。"
+            )
+            return
+
+        if resend:
+            yield event.plain_result("🔁 正在重新发送…")
+        for pid, info in pactions:
+            umo = info.get("umo") or event.unified_msg_origin
+            ids = info.get("ids") or []
+            desc = info.get("desc") or "内容"
+            record = self._pending.get(pid) or self._resolve_local_record(pid, ids, desc, umo)
+            if record is None:
+                yield event.plain_result(f"{_truncate(desc, 40)} 的本地文件已不存在，请重新下载。")
+                continue
+            ok, detail_msg = await self._deliver(umo, record, retry=resend)
+            name = f"{desc}（车号 {ids[0]}）" if ids else desc
+            if ok:
+                self._pending.pop(pid, None)
+                yield event.plain_result(f"📤 已发送 {name}。{detail_msg}")
+            else:
+                self._pending[pid] = record
+                retry_hint = f"jm resend {ids[0]}" if ids else "jm resend"
+                yield event.plain_result(
+                    f"❌ 发送 {name} 失败：{detail_msg}\n可用 {retry_hint} 重新发送。"
+                )
+
+    def _local_exists(self, aid: str) -> bool:
+        """本地下载目录中是否存在该车号（目录形如 <车号>_<标题>）。"""
+        root = self._download_root()
+        if not os.path.isdir(root):
+            return False
+        dirs, _files = self._scan_local(root)
+        return any(name.startswith(f"{aid}_") for name, _ in dirs)
+
+    def _resolve_local_record(self, pid: str, ids: List[str], desc: str, umo: str) -> Optional[Dict[str, Any]]:
+        """待发送记录丢失（如重启）时，尝试从本地下载目录重建发送记录。"""
+        root = self._download_root()
+        if not os.path.isdir(root):
+            return None
+        export_files: List[str] = []
+        image_files: List[str] = []
+        aid = ids[0] if ids else ""
+        dirs, files = self._scan_local(root)
+        target_dir = next((n for n, _ in dirs if aid and n.startswith(f"{aid}_")), None)
+        if target_dir is None:
+            return None
+        title = target_dir[len(aid) + 1:] if aid else target_dir
+        for ext in (".zip", ".pdf"):
+            fp = os.path.join(root, title + ext)
+            if os.path.isfile(fp):
+                export_files.append(fp)
+        photo_dir = os.path.join(root, target_dir)
+        if os.path.isdir(photo_dir):
+            for name in sorted(os.listdir(photo_dir)):
+                fp = os.path.join(photo_dir, name)
+                if os.path.isfile(fp) and os.path.splitext(name)[1].lower() in (
+                    ".jpg", ".jpeg", ".png", ".webp", ".gif"
+                ):
+                    image_files.append(fp)
+        return {
+            "umo": umo,
+            "desc": desc,
+            "ids": ids,
+            "export_files": export_files,
+            "image_files": image_files,
+            "send_mode": str(self.config.get("send_mode") or "zip").strip(),
+            "created": time.time(),
+        }
+
+    async def _deliver(self, umo: str, record: Dict[str, Any], retry: bool = False) -> Tuple[bool, str]:
+        """
+        执行一次发送，返回 (是否成功, 说明文本)。
+
+        :param retry: 为 True 时先确保文件服务可用（应对首次发送时服务已退出）。
+        """
+        export_files = [p for p in record.get("export_files") or [] if os.path.isfile(p)]
+        image_files = [p for p in record.get("image_files") or [] if os.path.isfile(p)]
+        send_mode = str(record.get("send_mode") or "zip").strip()
+        if send_mode not in ("zip", "pdf", "images", "none"):
+            send_mode = "zip"
+
+        if send_mode in ("zip", "pdf") and export_files:
+            if retry or self._file_server_proc is None or self._file_server_proc.poll() is not None:
+                self._ensure_file_server(self._download_root())
+            sent = 0
+            failed = []
+            for path in export_files:
+                if await self._send_file(umo, path):
+                    sent += 1
+                else:
+                    failed.append(os.path.basename(path))
+            if sent == 0 and failed:
+                return False, "文件发送全部失败（" + "、".join(failed[:3]) + "）"
+            msg = f"文件 {sent} 个" + (f"，失败 {len(failed)} 个" if failed else "")
+            return True, msg
+
+        if send_mode == "images" and image_files:
+            await self._send_images(umo, image_files)
+            return True, f"图片 {min(len(image_files), MAX_IMAGES_SEND)} 张"
+
+        return True, "（当前发送模式下没有需要发送的文件）"
+
+    @jm.command("stop", alias={"停止"})
+    async def jm_stop(self, event: AstrMessageEvent, content: GreedyStr):
+        """停止下载：中断正在进行的下载任务。"""
+        target = _first_id(content)
+        if not self._tasks:
+            yield event.plain_result("当前没有进行中的下载任务。")
+            return
+        stopped = []
+        for key, info in list(self._tasks.items()):
+            if target and target not in info["ids"]:
+                continue
+            # 先通过 DownloadControl 在 jmcomic 的检查点优雅停止，
+            # 让 _download_task 能捕获到取消并正常发出停止通知。
+            try:
+                info["control"].cancel("用户停止下载")
+            except Exception as e:
+                logger.error(f"[jmcomic] 停止任务失败: {e}")
+            task = info.get("task")
+            if task is not None and not task.done():
+                self._schedule_force_cancel(task)
+            stopped.append(info["desc"])
+            self._tasks.pop(key, None)
+        if not stopped:
+            yield event.plain_result(
+                f"没有找到车号 {target} 的进行中下载任务。可用 jm list 查看当前任务。"
+            )
+            return
+        yield event.plain_result(
+            "🛑 已停止下载：" + "、".join(stopped) + "\n（正在收尾，已下载的部分会保留在服务器）"
+        )
+
+    def _schedule_force_cancel(self, task: "asyncio.Task") -> None:
+        """给任务留出优雅退出的时间，超时后强制中断，避免卡在 I/O 上停不下来。"""
+
+        async def _force_cancel() -> None:
+            try:
+                await asyncio.wait({task}, timeout=FORCE_CANCEL_GRACE)
+            except Exception:
+                pass
+            if not task.done():
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+                logger.warning("[jmcomic] 下载任务未在优雅期内退出，已强制中断")
+
+        try:
+            asyncio.get_running_loop().create_task(_force_cancel())
+        except RuntimeError:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+
     @jm.command("help", alias={"帮助", "?"})
     async def help_cmd(self, event: AstrMessageEvent):
         """显示帮助。"""
@@ -678,9 +894,10 @@ class JMComicPlugin(Star):
         option,
         control,
     ):
-        """后台执行下载，完成后按发送模式把内容发回原会话。"""
+        """后台执行下载；完成后按配置决定是否等待用户确认再发送。"""
         export_files: List[str] = []
         image_files: List[str] = []
+        cancelled = False
         try:
             lines: List[str] = []
             if album_ids:
@@ -695,28 +912,71 @@ class JMComicPlugin(Star):
                 self._collect_result(lines, res, export_files, image_files)
             msg = "\n".join(lines) if lines else "下载任务已完成，但没有返回结果。"
         except asyncio.CancelledError:
-            msg = "下载任务已被取消。"
+            cancelled = True
+            msg = "🛑 下载已停止。"
         except Exception as e:
-            logger.error(f"[jmcomic] 下载任务异常: {e}")
-            msg = f"下载失败：{_truncate(e, 200)}"
+            if control is not None and getattr(control, "is_cancelled", False):
+                cancelled = True
+                msg = "🛑 下载已停止。"
+            else:
+                logger.error(f"[jmcomic] 下载任务异常: {e}")
+                msg = f"下载失败：{_truncate(e, 200)}"
         finally:
             self._tasks.pop(key, None)
 
         send_mode = str(self.config.get("send_mode") or "zip").strip()
         if send_mode not in ("zip", "pdf", "images", "none"):
             send_mode = "zip"
+
+        if cancelled:
+            try:
+                await self.context.send_message(umo, MessageChain().message(msg))
+            except Exception as e:
+                logger.error(f"[jmcomic] 发送停止提示失败: {e}")
+            return
+
+        need_confirm = bool(self.config.get("confirm_before_send", True))
+        has_payload = bool(export_files or image_files)
+
+        if need_confirm and has_payload:
+            # 先登记待发送记录，等用户 jm send 确认
+            ids = album_ids + photo_ids
+            desc = ", ".join([f"album:{a}" for a in album_ids] + [f"photo:p{p}" for p in photo_ids])
+            self._pending_seq += 1
+            pid = f"p{self._pending_seq}"
+            self._pending[pid] = {
+                "umo": umo,
+                "desc": desc,
+                "ids": ids,
+                "export_files": export_files,
+                "image_files": image_files,
+                "send_mode": send_mode,
+                "created": time.time(),
+            }
+            hint = "zip/pdf 文件" if send_mode in ("zip", "pdf") else "图片"
+            tip = (
+                f"{msg}\n\n"
+                f"📦 已下载完成（{hint}），暂未发送。\n"
+                f"回复 jm send {ids[0] if ids else ''}".rstrip() + " 确认发送，"
+                "或用 jm resend 重新发送。"
+            )
+            try:
+                await self.context.send_message(umo, MessageChain().message(tip))
+            except Exception as e:
+                logger.error(f"[jmcomic] 发送下载完成提示失败: {e}")
+            return
+
+        # 无需确认：直接发送
+        record = {
+            "umo": umo,
+            "desc": "", "ids": album_ids + photo_ids,
+            "export_files": export_files, "image_files": image_files,
+            "send_mode": send_mode, "created": time.time(),
+        }
         try:
-            if send_mode == "images" and image_files:
-                await self._send_images(umo, image_files)
-            elif send_mode in ("zip", "pdf") and export_files:
-                sent = 0
-                for path in export_files:
-                    if await self._send_file(umo, path):
-                        sent += 1
-                    else:
-                        msg += f"\n⚠️ 文件 {os.path.basename(path)} 发送失败，已保存在服务器。"
-                if sent:
-                    msg += f"\n已发送 {sent} 个文件到当前会话。"
+            ok, detail_msg = await self._deliver(umo, record)
+            if not ok:
+                msg += f"\n⚠️ {detail_msg}，已保存到服务器本地。"
             await self.context.send_message(umo, MessageChain().message(msg))
         except Exception as e:
             logger.error(f"[jmcomic] 发送下载结果失败: {e}")

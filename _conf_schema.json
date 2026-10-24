@@ -72,5 +72,10 @@
     "description": "是否输出 jmcomic 的详细请求日志（排查问题时开启）",
     "type": "bool",
     "default": false
+  },
+  "confirm_before_send": {
+    "description": "下载完成后是否需要用户确认（jm send）才发送文件；关闭则下载完直接发送",
+    "type": "bool",
+    "default": true
   }
 }
